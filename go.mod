@@ -1,6 +1,6 @@
 module github.com/strongo/analytics2ga4
 
-go 1.24.3
+go 1.27.0
 
 require github.com/strongo/analytics v0.2.5
 
