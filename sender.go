@@ -130,7 +130,7 @@ func (s *sender) send(ctx context.Context, c resolvedClient, payload ga4Payload)
 	if err != nil {
 		return fmt.Errorf("http: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("non-2xx response: %d", resp.StatusCode)
