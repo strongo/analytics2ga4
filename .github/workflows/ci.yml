@@ -24,9 +24,8 @@ jobs:
     with:
       disable-version-bumping: true
       go_version: '1.27.0'
-      # Measured (go test ./... -coverprofile + go tool cover -func): 88.6%.
-      # Floor set a few points below so the gate doesn't fail on day one from
-      # measurement noise. Note: the Lint job is still expected to be RED --
-      # see PR description (unused batching fields is a real finding, not
-      # papered over here).
+      # Measured (go test ./... -coverprofile + go tool cover -func): 91.4%
+      # after GA4 batching (maxEventsPerBatch/mu/pending) was wired into
+      # QueueMessage/Flush/Close. Floor set a few points below so the gate
+      # doesn't fail on day-to-day measurement noise.
       min_test_coverage_percent: 86
