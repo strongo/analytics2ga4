@@ -42,7 +42,36 @@ analytics.AddSender(sender)
 msg := analytics.NewEvent("command_received", "bot", "start")
 msg.SetUserContext(analytics.NewUserContext(strconv.FormatInt(telegramUserID, 10)))
 analytics.QueueMessage(ctx, msg)
+
+// During shutdown: QueueMessage only buffers events in memory and never
+// sends synchronously, so this MUST be called or any not-yet-full batch is
+// lost.
+defer sender.Close(context.Background())
 ```
+
+### Batching
+
+`QueueMessage` never makes an HTTP call itself. Events are buffered per GA4
+`client_id` (derived from the message's user) and shipped to GA4 once that
+client's batch reaches `maxEventsPerBatch` (25, the Measurement Protocol
+limit on events per request), `DefaultFlushInterval` elapses, or
+`Flush`/`Close` is called. Events for different end users are never merged
+into one request, since a single GA4 request only carries one
+`client_id`/`user_id` for all of its events.
+
+The periodic timer (`DefaultFlushInterval`, 30s by default; override per
+`Client` via `FlushInterval`) exists because a single end user rarely
+generates a full 25-event batch: without a timer, a low-traffic caller that
+never calls `Flush`/`Close` (e.g. a Cloud Run instance recycled mid-session)
+would silently strand that user's events forever. `NewSender` starts this
+timer goroutine; `Close` stops it.
+
+Call `Flush(ctx)` whenever you want buffered events sent immediately without
+tearing the sender down (e.g. before a deploy or a batch job exits), and call
+`Close(ctx)` during application shutdown — it stops the timer, flushes once,
+and is safe to call more than once. Calling `Close` is still recommended even
+though the timer is a safety net: it gives a deterministic delivery point
+instead of relying on the next tick.
 
 ### Custom HTTP client / endpoint
 
@@ -60,7 +89,7 @@ analytics2ga4.Client{
 - Every event automatically includes `session_id` (derived from client ID + UTC day) and `engagement_time_msec=1`; without these, events are silently dropped from standard and realtime GA4 reports.
 - Event names are sanitised to GA4 rules: alphanumerics and underscores, starting with a letter, max 40 characters.
 - `surface=telegram_bot` is injected into every event's params unless the message already carries a `surface` property.
-- Multiple clients → fan-out: one HTTP POST per client per `QueueMessage` call.
+- Multiple clients → fan-out: one HTTP POST per client per flushed batch (see [Batching](#batching)).
 
 ## Message mapping
 

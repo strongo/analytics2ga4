@@ -1,0 +1,33 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+
+  strongo_workflow:
+    permissions:
+      contents: write
+    # Pinned to an exact tag, not the moving @v1 tag: @v1 has been retired
+    # because it drifted patch releases behind while still accepting inputs
+    # it did not implement, so a configured input could silently no-op.
+    uses: strongo/cicd/.github/workflows/workflow.yml@v1.14.17
+
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+    with:
+      disable-version-bumping: true
+      go_version: '1.27.0'
+      # Measured (go test ./... -coverprofile + go tool cover -func): 92.8%
+      # after GA4 batching (maxEventsPerBatch/mu/pending) was wired into
+      # QueueMessage/Flush/Close, plus a periodic flush timer so a partial
+      # batch is delivered even without an explicit Flush/Close call. Floor
+      # set a few points below so the gate doesn't fail on day-to-day
+      # measurement noise.
+      min_test_coverage_percent: 86
