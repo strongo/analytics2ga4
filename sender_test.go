@@ -23,14 +23,25 @@ type NoOpLogger struct{}
 func (n NoOpLogger) Warningf(_ context.Context, _ string, _ ...any) {}
 func (n NoOpLogger) Errorf(_ context.Context, _ string, _ ...any)   {}
 
-// captureLogger records error calls for assertion.
+// captureLogger records error calls for assertion. Guarded by mu since the
+// periodic flusher goroutine can call Errorf concurrently with the test
+// goroutine reading errors.
 type captureLogger struct {
+	mu     sync.Mutex
 	errors []string
 }
 
 func (c *captureLogger) Warningf(_ context.Context, _ string, _ ...any) {}
 func (c *captureLogger) Errorf(_ context.Context, f string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.errors = append(c.errors, f)
+}
+
+func (c *captureLogger) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.errors)
 }
 
 // --- helpers ---
@@ -109,6 +120,7 @@ func TestNewSender_Valid(t *testing.T) {
 	if s == nil {
 		t.Fatal("sender is nil")
 	}
+	defer func() { _ = s.Close(context.Background()) }()
 }
 
 // --- session envelope always present ---
@@ -124,6 +136,7 @@ func TestSessionEnvelopeAlwaysPresent(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewEvent("click", "ui", "button")
 	msg.SetUserContext(userCtx("user-1"))
@@ -158,6 +171,7 @@ func TestPageviewMessage(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewPageview("example.com", "/home")
 	msg.SetTitle("Home page")
@@ -194,6 +208,7 @@ func TestErrorMessage(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	dbErr := errorString("database unavailable")
 	msg := analytics.NewErrorMessage(dbErr)
@@ -227,6 +242,7 @@ func TestEventMessage(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewEvent("purchase", "ecommerce", "buy_now")
 	msg.SetLabel("promo-2024")
@@ -289,6 +305,7 @@ func TestMultiClientFanOut(t *testing.T) {
 		Client{MeasurementID: "G-ONE", APISecret: "s1", Endpoint: srv1.URL, HTTPClient: srv1.Client()},
 		Client{MeasurementID: "G-TWO", APISecret: "s2", Endpoint: srv2.URL, HTTPClient: srv2.Client()},
 	)
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewEvent("test", "category", "action")
 	msg.SetUserContext(userCtx("user-5"))
@@ -318,6 +335,7 @@ func TestSurfaceParamDefault(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewEvent("nav", "ui", "click")
 	msg.SetUserContext(userCtx("user-6"))
@@ -350,6 +368,7 @@ func TestErrorLoggingOnNon2xx(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewEvent("test", "cat", "act")
 	msg.SetUserContext(userCtx("user-7"))
@@ -358,7 +377,7 @@ func TestErrorLoggingOnNon2xx(t *testing.T) {
 		t.Error("expected Flush to return an error for a non-2xx response")
 	}
 
-	if len(cl.errors) == 0 {
+	if cl.count() == 0 {
 		t.Error("expected at least one error to be logged for non-2xx response")
 	}
 }
@@ -376,6 +395,7 @@ func TestTimingMessage(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msg := analytics.NewTiming("db_query", 250*time.Millisecond)
 	msg.SetUserContext(userCtx("user-8"))
@@ -410,6 +430,7 @@ func TestBatchAccumulatesUntilFlush(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	for i := 0; i < maxEventsPerBatch-1; i++ {
 		msg := analytics.NewEvent(fmt.Sprintf("evt-%d", i), "cat", "act")
@@ -448,6 +469,7 @@ func TestBatchFlushesExactlyOnceWhenFull(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	for i := 0; i < maxEventsPerBatch; i++ {
 		msg := analytics.NewEvent(fmt.Sprintf("evt-%d", i), "cat", "act")
@@ -486,6 +508,7 @@ func TestFlushSeparatesEventsByClientID(t *testing.T) {
 		Endpoint:      srv.URL,
 		HTTPClient:    srv.Client(),
 	})
+	defer func() { _ = s.Close(context.Background()) }()
 
 	msgA := analytics.NewEvent("a", "cat", "act")
 	msgA.SetUserContext(userCtx("user-a"))
@@ -555,6 +578,73 @@ func TestCloseFlushesPendingEvents(t *testing.T) {
 	}
 	if got := snapshot(mu, &payloads); len(got) != 1 {
 		t.Fatalf("second Close must not add a request, got %d total", len(got))
+	}
+}
+
+// TestTimeBasedFlushWithoutSizeOrExplicitFlush verifies that a batch which
+// never reaches maxEventsPerBatch, and is never flushed by an explicit
+// Flush/Close call, is still delivered -- purely because the periodic
+// flush timer fires. This is the low-traffic-consumer scenario the timer
+// exists for: a single end user rarely queues 25 events, and a caller that
+// never calls Flush/Close (e.g. a Cloud Run instance recycled mid-life)
+// would otherwise strand that user's events forever.
+//
+// Uses a short Client.FlushInterval instead of an injectable clock so the
+// production code stays simple; the test itself blocks on a channel signaled
+// by the test server rather than sleeping, bounded by a generous timeout
+// that only matters on failure.
+func TestTimeBasedFlushWithoutSizeOrExplicitFlush(t *testing.T) {
+	delivered := make(chan ga4Payload, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var p ga4Payload
+		if err := json.Unmarshal(body, &p); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		select {
+		case delivered <- p:
+		default:
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	s, err := NewSender(NoOpLogger{}, Client{
+		MeasurementID: "G-TEST",
+		APISecret:     "secret",
+		Endpoint:      srv.URL,
+		HTTPClient:    srv.Client(),
+		FlushInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewSender: %v", err)
+	}
+	defer func() { _ = s.Close(context.Background()) }()
+
+	msg := analytics.NewEvent("idle-user-event", "cat", "act")
+	msg.SetUserContext(userCtx("lonely-user"))
+	s.QueueMessage(context.Background(), msg)
+	// Deliberately no Flush and no Close here: only 1 of 25 events is
+	// queued, so only the periodic timer can deliver it.
+
+	select {
+	case p := <-delivered:
+		if len(p.Events) != 1 {
+			t.Fatalf("expected 1 event in the timer-flushed request, got %d", len(p.Events))
+		}
+		if p.Events[0].Name != "idle_user_event" {
+			t.Errorf("event name = %q, want idle_user_event", p.Events[0].Name)
+		}
+		if p.ClientID != "lonely-user" {
+			t.Errorf("client_id = %q, want lonely-user", p.ClientID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("event was not delivered by the periodic flush timer within 2s")
 	}
 }
 

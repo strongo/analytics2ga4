@@ -54,14 +54,24 @@ defer sender.Close(context.Background())
 `QueueMessage` never makes an HTTP call itself. Events are buffered per GA4
 `client_id` (derived from the message's user) and shipped to GA4 once that
 client's batch reaches `maxEventsPerBatch` (25, the Measurement Protocol
-limit on events per request) or `Flush`/`Close` is called. Events for
-different end users are never merged into one request, since a single GA4
-request only carries one `client_id`/`user_id` for all of its events.
+limit on events per request), `DefaultFlushInterval` elapses, or
+`Flush`/`Close` is called. Events for different end users are never merged
+into one request, since a single GA4 request only carries one
+`client_id`/`user_id` for all of its events.
+
+The periodic timer (`DefaultFlushInterval`, 30s by default; override per
+`Client` via `FlushInterval`) exists because a single end user rarely
+generates a full 25-event batch: without a timer, a low-traffic caller that
+never calls `Flush`/`Close` (e.g. a Cloud Run instance recycled mid-session)
+would silently strand that user's events forever. `NewSender` starts this
+timer goroutine; `Close` stops it.
 
 Call `Flush(ctx)` whenever you want buffered events sent immediately without
 tearing the sender down (e.g. before a deploy or a batch job exits), and call
-`Close(ctx)` during application shutdown — it flushes once and is safe to
-call more than once.
+`Close(ctx)` during application shutdown — it stops the timer, flushes once,
+and is safe to call more than once. Calling `Close` is still recommended even
+though the timer is a safety net: it gives a deterministic delivery point
+instead of relying on the next tick.
 
 ### Custom HTTP client / endpoint
 

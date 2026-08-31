@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/strongo/analytics"
 )
@@ -18,6 +19,14 @@ const DefaultEndpoint = "https://www.google-analytics.com/mp/collect"
 // maxEventsPerBatch is the GA4 Measurement Protocol limit for events in a
 // single request body (https://developers.google.com/analytics/devguides/collection/protocol/ga4/sending-events#limitations).
 const maxEventsPerBatch = 25
+
+// DefaultFlushInterval is how often a sender flushes buffered batches on a
+// timer when no Client overrides FlushInterval. It exists so events are
+// eventually delivered even when a batch never reaches maxEventsPerBatch and
+// the caller never calls Flush/Close -- e.g. a low-traffic end user on a
+// process instance that gets recycled (Cloud Run, container rollout, etc.)
+// before either trigger fires.
+const DefaultFlushInterval = 30 * time.Second
 
 // Client holds credentials and HTTP config for one GA4 property stream.
 type Client struct {
@@ -33,18 +42,30 @@ type Client struct {
 
 	// HTTPClient is the HTTP client to use.  Defaults to http.DefaultClient.
 	HTTPClient *http.Client
+
+	// FlushInterval overrides how often the sender flushes buffered batches
+	// on a timer, even if a batch never reaches maxEventsPerBatch and
+	// nobody calls Flush/Close. Zero uses DefaultFlushInterval. When
+	// multiple Clients set different positive values, the sender uses the
+	// smallest one, so it flushes at least as often as the most demanding
+	// client wants.
+	FlushInterval time.Duration
 }
 
 // Sender is the analytics2ga4 sender. It satisfies analytics.Sender, so it
 // can be registered with analytics.AddSender like before, and additionally
 // exposes explicit batch control.
 //
-// QueueMessage buffers events in memory and only ships them to GA4 once a
-// batch fills up or Flush/Close is called -- it never blocks on a network
-// call per message. Callers MUST call Flush or Close during application
-// shutdown (or whenever a guaranteed delivery point is needed): any events
-// still buffered when the process exits without a final Flush/Close are
-// lost, the same way any other in-memory buffer would lose them.
+// QueueMessage buffers events in memory and ships them to GA4 once a batch
+// fills up, DefaultFlushInterval (or a Client's FlushInterval override)
+// elapses, or Flush/Close is called -- it never blocks on a network call per
+// message. The periodic timer is a safety net for low-traffic callers: a
+// single end user rarely generates a full 25-event batch, so without it,
+// events would only ever leave via an explicit Flush/Close that many host
+// processes (e.g. a Cloud Run instance that gets recycled) never call,
+// silently losing them forever. Calling Flush or Close explicitly is still
+// the only way to get a deterministic delivery point (e.g. right before a
+// graceful shutdown); Close additionally stops the timer goroutine.
 type Sender interface {
 	analytics.Sender
 
@@ -52,8 +73,9 @@ type Sender interface {
 	// yet full. Safe to call concurrently with QueueMessage and with itself.
 	Flush(ctx context.Context) error
 
-	// Close flushes any buffered events and marks the sender closed. It is
-	// safe to call multiple times; only the first call flushes.
+	// Close stops the periodic flush timer and flushes any buffered events.
+	// It is safe to call multiple times; only the first call stops the timer
+	// and flushes.
 	Close(ctx context.Context) error
 }
 
@@ -88,7 +110,22 @@ func NewSender(logger Logger, clients ...Client) (Sender, error) {
 			httpClient:    httpClient,
 		})
 	}
-	return &sender{logger: logger, clients: resolved}, nil
+	interval := time.Duration(0)
+	for _, c := range clients {
+		if c.FlushInterval <= 0 {
+			continue
+		}
+		if interval == 0 || c.FlushInterval < interval {
+			interval = c.FlushInterval
+		}
+	}
+	if interval <= 0 {
+		interval = DefaultFlushInterval
+	}
+
+	s := &sender{logger: logger, clients: resolved, flushInterval: interval}
+	s.startFlusher()
+	return s, nil
 }
 
 type resolvedClient struct {
@@ -118,7 +155,43 @@ type sender struct {
 	// map, so its size tracks only what is currently un-sent.
 	pending map[string]*pendingBatch
 
+	// flushInterval is how often the background flusher goroutine calls
+	// Flush, regardless of batch size or whether QueueMessage is ever
+	// called again (see startFlusher).
+	flushInterval time.Duration
+	stopFlusher   chan struct{} // closed by Close to stop the flusher goroutine
+	flusherDone   chan struct{} // closed by the flusher goroutine when it exits
+
 	closeOnce sync.Once
+}
+
+// startFlusher launches the background goroutine that calls Flush on a
+// fixed interval, so a batch that never reaches maxEventsPerBatch and is
+// never explicitly flushed still gets delivered eventually. It must be
+// called exactly once, from NewSender, before the sender is returned to the
+// caller. Close stops it.
+func (s *sender) startFlusher() {
+	s.stopFlusher = make(chan struct{})
+	s.flusherDone = make(chan struct{})
+
+	go func() {
+		defer close(s.flusherDone)
+
+		ticker := time.NewTicker(s.flushInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Best-effort: per-client failures are already logged
+				// inside sendBatch, and there is no caller here to report
+				// an aggregate error to.
+				_ = s.Flush(context.Background())
+			case <-s.stopFlusher:
+				return
+			}
+		}
+	}()
 }
 
 // QueueMessage converts the analytics.Message to a GA4 event and enqueues it
@@ -191,12 +264,14 @@ func (s *sender) Flush(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// Close flushes any buffered events. It is safe to call multiple times;
-// only the first call performs a flush, so it is safe to defer alongside an
-// earlier explicit Flush.
+// Close stops the periodic flush timer and flushes any buffered events. It
+// is safe to call multiple times; only the first call stops the timer and
+// flushes, so it is safe to defer alongside an earlier explicit Flush.
 func (s *sender) Close(ctx context.Context) error {
 	var err error
 	s.closeOnce.Do(func() {
+		close(s.stopFlusher)
+		<-s.flusherDone
 		err = s.Flush(ctx)
 	})
 	return err
