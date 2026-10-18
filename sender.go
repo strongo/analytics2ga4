@@ -302,9 +302,11 @@ func (s *sender) sendBatch(ctx context.Context, clientID string, batch *pendingB
 	return errors.Join(errs...)
 }
 
+var jsonMarshal = json.Marshal
+
 // send posts a ga4Payload to one GA4 property.
 func (s *sender) send(ctx context.Context, c resolvedClient, payload ga4Payload) error {
-	body, err := json.Marshal(payload)
+	body, err := jsonMarshal(payload)
 	if err != nil {
 		return fmt.Errorf("json.Marshal: %w", err)
 	}
