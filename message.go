@@ -76,7 +76,7 @@ func sessionID(clientID string) string {
 }
 
 // buildGA4Event converts an analytics.Message into a ga4Event.
-func buildGA4Event(msg analytics.Message) (ga4Event, error) {
+var buildGA4Event = func(msg analytics.Message) (ga4Event, error) {
 	params := make(map[string]string, 20)
 
 	// Copy custom properties first (lowest precedence).

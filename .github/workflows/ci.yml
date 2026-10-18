@@ -30,4 +30,4 @@ jobs:
       # batch is delivered even without an explicit Flush/Close call. Floor
       # set a few points below so the gate doesn't fail on day-to-day
       # measurement noise.
-      min_test_coverage_percent: 86
+      min_test_coverage_percent: 100
